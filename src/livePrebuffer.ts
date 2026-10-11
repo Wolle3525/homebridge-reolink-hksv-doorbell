@@ -10,10 +10,9 @@ const MAX_RECONNECT_DELAY_MS = 30000;
 const TS_PACKET_SIZE = 188;
 // How much recently-seen output to *keep available* so a newly-joining session can be handed a
 // running start instead of whatever byte happens to be flowing right now - this needs to reliably
-// span at least one full GOP, since `dump_extra=freq=keyframe` only re-inserts SPS/PPS before every
-// keyframe. This window is intentionally generous (matching Scrypted's rebroadcast plugin, which
-// keeps 10s) because - unlike an earlier version of this class - it no longer determines how much
-// gets *replayed*: see lastKeyframeBytePos below and getBacklogSinceLastKeyframe(). A wide window
+// span at least one full GOP, since SPS/PPS are inserted before IDR frames. This window is
+// intentionally generous (matching Scrypted's rebroadcast plugin, which keeps 10s) because it no
+// longer determines how much gets replayed: see getBacklogSinceLastKeyframe(). A wide window
 // mainly guards against unusually long GOP configurations; it doesn't cost a longer catch-up burst.
 const BACKLOG_MAX_AGE_MS = 8000;
 // Absolute safety net regardless of age, in case of an unexpectedly high-bitrate source - not the
@@ -41,8 +40,8 @@ interface BacklogEntry {
  * need to renegotiate anything - just find the next PAT/PMT and SPS, both of which repeat
  * constantly in a running MPEG-TS stream.
  *
- * A newly-joining session is handed the backlog *since the most recently seen keyframe* rather
- * than the whole backlog window - found by scanning the MPEG-TS stream's own packet headers for
+ * A newly-joining session is handed the backlog starting at the tables before the latest keyframe
+ * rather than the whole backlog window - found by scanning MPEG-TS packet headers for
  * the random_access_indicator flag (matching what Scrypted's rebroadcast plugin does via NAL
  * parsing, adapted here to the TS container ffmpeg wraps this output in). Without this, a session
  * joining a connection that's been kept warm for a while gets the *entire* multi-second window
@@ -60,8 +59,10 @@ export class LivePrebuffer {
   private totalBytes = 0;
   /** Leftover bytes (< one TS packet) carried over between stdout chunks so packet parsing stays aligned regardless of how the OS happens to chunk the pipe. */
   private tsCarry: Buffer = Buffer.alloc(0);
-  /** Absolute byte offset (in the same coordinate space as BacklogEntry.startByte) of the start of the most recently seen keyframe's TS packet, or -1 if none has been seen yet on this connection. */
-  private lastKeyframeBytePos = -1;
+  /** Absolute byte offset of the latest PAT packet, which the TS muxer emits before video keyframes. */
+  private lastPatBytePos = -1;
+  /** Absolute byte offset of the PAT/PMT preceding the latest video keyframe, or -1 if none was found. */
+  private lastReplayStartBytePos = -1;
 
   constructor(
     private readonly ffmpegPath: string,
@@ -82,12 +83,16 @@ export class LivePrebuffer {
     // ffmpeg crashed but hasn't been released() yet) throws an unhandled 'error' that would crash
     // the whole child bridge process rather than just that one session.
     sink.on('error', () => this.sinks.delete(sink));
-    // Hand the new sink the backlog since the last known keyframe before it starts receiving live
-    // chunks, so it gets a running start (a keyframe+SPS/PPS right at the beginning of what it
-    // receives) instead of having to wait, live, for the next one to come around. This happens
+    // Hand the new sink the backlog from the tables before the last video keyframe, so it gets a
+    // running start (PAT/PMT followed by a keyframe with SPS/PPS) before it starts receiving live
+    // chunks. This happens
     // synchronously with no await in between, so no live chunk can slip in between the backlog
     // replay and the sink being added to `sinks` below - no gap, no duplicate delivery.
-    const replay = this.getBacklogSinceLastKeyframe();
+    // A stopped or reconnecting source may still have bytes from its previous
+    // MPEG-TS timeline in the backlog. Never prepend those to a new connection.
+    const replay = this.process && !this.process.killed
+      ? this.getBacklogSinceLastKeyframe()
+      : Buffer.alloc(0);
     if (replay.length > 0) {
       sink.write(replay);
     }
@@ -96,25 +101,27 @@ export class LivePrebuffer {
   }
 
   /**
-   * Returns the backlog trimmed to start at the most recently detected keyframe, so a joining
-   * session gets the smallest amount of "past" data that still reliably includes one. Falls back
-   * to the full backlog if no keyframe has been located yet (e.g. right at connection start) -
-   * the same behavior this class had before keyframe-precise trimming existed.
+   * Returns the backlog trimmed to start at the PAT before the latest video keyframe. Falls back
+   * to the full backlog if no keyframe has been located yet. If the required PAT has already been
+   * trimmed, wait for the next one instead of replaying an undecodable fragment.
    */
   private getBacklogSinceLastKeyframe(): Buffer {
     if (this.backlog.length === 0) {
       return Buffer.alloc(0);
     }
-    if (this.lastKeyframeBytePos < 0) {
+    if (this.lastReplayStartBytePos < 0) {
       return Buffer.concat(this.backlog.map((entry) => entry.chunk), this.backlogBytes);
+    }
+    if (this.lastReplayStartBytePos < this.backlog[0].startByte) {
+      return Buffer.alloc(0);
     }
     const parts: Buffer[] = [];
     let total = 0;
     for (const entry of this.backlog) {
-      if (entry.startByte + entry.chunk.length <= this.lastKeyframeBytePos) {
+      if (entry.startByte + entry.chunk.length <= this.lastReplayStartBytePos) {
         continue;
       }
-      const sliceStart = Math.max(0, this.lastKeyframeBytePos - entry.startByte);
+      const sliceStart = Math.max(0, this.lastReplayStartBytePos - entry.startByte);
       const piece = sliceStart > 0 ? entry.chunk.subarray(sliceStart) : entry.chunk;
       parts.push(piece);
       total += piece.length;
@@ -123,16 +130,13 @@ export class LivePrebuffer {
   }
 
   /**
-   * Scans a chunk of MPEG-TS output for packets that mark the start of a keyframe access unit,
-   * updating lastKeyframeBytePos when one is found. TS packets are a fixed 188 bytes, but stdout
-   * delivers arbitrary byte chunks with no relation to that boundary, so leftover bytes from an
+   * Scans a chunk of MPEG-TS output for PAT packets and video keyframes. TS packets are 188 bytes,
+   * but stdout delivers arbitrary byte chunks with no relation to that boundary, so bytes from an
    * incomplete trailing packet are carried over (via tsCarry) and prepended to the next chunk.
    *
-   * A packet marks a keyframe start when its payload_unit_start_indicator is set (a new access
-   * unit begins here) and its adaptation field's random_access_indicator is set - ffmpeg's mpegts
-   * muxer sets this for the video stream specifically at each keyframe, which - combined with
-   * `dump_extra=freq=keyframe` upstream guaranteeing SPS/PPS immediately follows - is exactly the
-   * point a joining session needs to start reading from.
+   * The random_access_indicator can also occur on audio packets, so check the PES stream ID for
+   * video. FFmpeg's TS muxer writes PAT/PMT before each video keyframe; replay must include those
+   * tables so a new demuxer can identify the video PID and its SPS/PPS-bearing IDR frame.
    */
   private scanForKeyframes(chunk: Buffer, chunkStartByte: number): void {
     const buf = this.tsCarry.length > 0 ? Buffer.concat([this.tsCarry, chunk]) : chunk;
@@ -147,12 +151,21 @@ export class LivePrebuffer {
         continue;
       }
       const payloadUnitStart = (buf[offset + 1] & 0x40) !== 0;
+      const pid = ((buf[offset + 1] & 0x1f) << 8) | buf[offset + 2];
+      if (payloadUnitStart && pid === 0) {
+        this.lastPatBytePos = bufStartByte + offset;
+      }
       const adaptationFieldControl = (buf[offset + 3] & 0x30) >> 4;
-      const hasAdaptationField = adaptationFieldControl === 2 || adaptationFieldControl === 3;
-      if (payloadUnitStart && hasAdaptationField) {
+      if (payloadUnitStart && adaptationFieldControl === 3) {
         const adaptationFieldLength = buf[offset + 4];
-        if (adaptationFieldLength > 0 && (buf[offset + 5] & 0x40) !== 0) {
-          this.lastKeyframeBytePos = bufStartByte + offset;
+        if (adaptationFieldLength > 0 && adaptationFieldLength <= 183 &&
+            (buf[offset + 5] & 0x40) !== 0) {
+          const payloadOffset = offset + 5 + adaptationFieldLength;
+          if (payloadOffset + 4 <= offset + TS_PACKET_SIZE &&
+              buf[payloadOffset] === 0 && buf[payloadOffset + 1] === 0 && buf[payloadOffset + 2] === 1 &&
+              (buf[payloadOffset + 3] & 0xf0) === 0xe0 && this.lastPatBytePos >= 0) {
+            this.lastReplayStartBytePos = this.lastPatBytePos;
+          }
         }
       }
       offset += TS_PACKET_SIZE;
@@ -193,9 +206,9 @@ export class LivePrebuffer {
     // Passthrough copy of both video and audio, regardless of the per-session codec/audio choice:
     // this stage only exists to keep one warm upstream connection, so sessions read whichever of
     // video/audio they need from this single relay. Re-encoding here would be redundant CPU work
-    // (a transcoding session still decodes+encodes downstream from this pipe), and dump_extra
-    // keeps SPS/PPS repeating before every keyframe so a session connecting mid-stream can decode
-    // immediately instead of waiting for the next time the camera itself repeats them.
+    // (a transcoding session still decodes+encodes downstream from this pipe). Convert RTMP's
+    // length-prefixed H.264 to Annex B after rewriting the SPS; the converter inserts SPS/PPS
+    // before IDR frames so a session connecting mid-stream can decode immediately.
     //
     // h264_metadata=level=auto rewrites the SPS's declared H.264 level to one that actually
     // matches the stream's real resolution/framerate/bitrate, in place, without re-encoding. This
@@ -206,7 +219,7 @@ export class LivePrebuffer {
     // can transport perfectly (every RTP packet muxed and delivered, no transport-level error) and
     // still never render an image: the decoder-facing metadata itself was invalid for HomeKit
     // regardless of how correct the transport is under it.
-    args.push('-map', '0', '-codec', 'copy', '-bsf:v', 'dump_extra=freq=keyframe,h264_metadata=level=auto');
+    args.push('-map', '0', '-codec', 'copy', '-bsf:v', 'h264_metadata=level=auto,h264_mp4toannexb');
     args.push('-f', 'mpegts', 'pipe:1');
 
     // Any previously buffered backlog belongs to the old connection - once it's gone, replaying
@@ -218,7 +231,8 @@ export class LivePrebuffer {
     this.backlogBytes = 0;
     this.totalBytes = 0;
     this.tsCarry = Buffer.alloc(0);
-    this.lastKeyframeBytePos = -1;
+    this.lastPatBytePos = -1;
+    this.lastReplayStartBytePos = -1;
 
     this.log.info(`[${this.label}] Starting live view prebuffer connection`);
     const proc = spawn(this.ffmpegPath, args, { env: process.env });

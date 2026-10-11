@@ -115,6 +115,8 @@ interface PendingSession {
   request: PrepareStreamRequest;
   localVideoPort: number;
   localAudioPort: number;
+  videoSsrc: number;
+  audioSsrc: number;
 }
 
 export class StreamingDelegate implements CameraStreamingDelegate {
@@ -145,15 +147,18 @@ export class StreamingDelegate implements CameraStreamingDelegate {
   async prepareStream(request: PrepareStreamRequest, callback: PrepareStreamCallback): Promise<void> {
     try {
       const [localVideoPort, localAudioPort] = await reservePorts(2);
+      const videoSsrc = this.hap.CameraController.generateSynchronisationSource();
+      const audioSsrc = this.hap.CameraController.generateSynchronisationSource();
 
       // Ports are stashed under the session so `handleStreamRequest` can bind ffmpeg's
-      // RTCP sockets to the exact ports advertised here.
-      this.pendingSessions.set(request.sessionID, { request, localVideoPort, localAudioPort });
+      // RTCP sockets to the exact ports advertised here. FFmpeg must also use the
+      // same SSRCs advertised to HomeKit in the response below.
+      this.pendingSessions.set(request.sessionID, { request, localVideoPort, localAudioPort, videoSsrc, audioSsrc });
 
       const response: PrepareStreamResponse = {
         video: {
           port: localVideoPort,
-          ssrc: this.hap.CameraController.generateSynchronisationSource(),
+          ssrc: videoSsrc,
           srtp_key: request.video.srtp_key,
           srtp_salt: request.video.srtp_salt,
         },
@@ -168,7 +173,7 @@ export class StreamingDelegate implements CameraStreamingDelegate {
       if (this.cameraConfig.enableAudio !== false) {
         response.audio = {
           port: localAudioPort,
-          ssrc: this.hap.CameraController.generateSynchronisationSource(),
+          ssrc: audioSsrc,
           srtp_key: request.audio.srtp_key,
           srtp_salt: request.audio.srtp_salt,
         };
@@ -216,7 +221,7 @@ export class StreamingDelegate implements CameraStreamingDelegate {
   }
 
   private async startStreamAsync(request: StartStreamRequest, pending: PendingSession): Promise<void> {
-    const { request: prepareRequest, localVideoPort, localAudioPort } = pending;
+    const { request: prepareRequest, localVideoPort, localAudioPort, videoSsrc, audioSsrc } = pending;
     // In copy mode we send whatever resolution the selected stream actually is, regardless of
     // what HomeKit negotiated - the main stream is commonly well above the highest resolution we
     // advertise (e.g. 2048x1536 vs. our advertised max of 1920x1080), a mismatch that can leave
@@ -283,7 +288,7 @@ export class StreamingDelegate implements CameraStreamingDelegate {
 
     args.push(
       '-payload_type', String(request.video.pt),
-      '-ssrc', String(toFfmpegSsrc(request.video.ssrc)),
+      '-ssrc', String(toFfmpegSsrc(videoSsrc)),
       '-f', 'rtp',
       '-srtp_out_suite', videoSrtpSuite,
       '-srtp_out_params', videoSrtpParams,
@@ -316,7 +321,7 @@ export class StreamingDelegate implements CameraStreamingDelegate {
         '-ac', String(request.audio.channel),
         '-flags', '+global_header',
         '-payload_type', String(request.audio.pt),
-        '-ssrc', String(toFfmpegSsrc(request.audio.ssrc)),
+        '-ssrc', String(toFfmpegSsrc(audioSsrc)),
         '-f', 'rtp',
         '-srtp_out_suite', audioSrtpSuite,
         '-srtp_out_params', audioSrtpParams,

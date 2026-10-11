@@ -88,6 +88,8 @@ export interface CameraConfig {
    * by their own apps, and has been reported to establish a live session more reliably.
    */
   liveViewRtmp?: boolean;
+  /** Rewrite the H.264 SPS level in the RTSP live prebuffer. Disable if h264_metadata rejects this camera's packets. Defaults to true. */
+  rtspH264Metadata?: boolean;
 }
 
 export interface MqttBrokerConfig {

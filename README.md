@@ -62,6 +62,12 @@ Bitrate, HKSV-Feinjustierung, Abfrageintervall, MQTT-Payload-Filter) liegen pro 
 unter dem einklappbaren Abschnitt *Erweitert* — die Standardwerte passen für die meisten
 Reolink-Geräte ohne Anpassung.
 
+Falls eine RTSP-Kamera im Livebild-Log `h264_metadata` zusammen mit
+`Invalid value at time_scale` meldet, kann unter *Erweitert → RTSP: H.264-Metadaten
+anpassen* der Filter nur für diese Kamera deaktiviert werden. In der manuellen
+`config.json` entspricht das `"rtspH264Metadata": false` im betreffenden
+Kameraeintrag. Andere Kameras und RTMP-Streams behalten die bisherige Verarbeitung.
+
 Analog dazu genügt für den MQTT-Broker (nur nötig bei Klingel-Ereignisquelle `mqtt`) eine
 einzige *MQTT-Broker-Adresse*, ebenfalls optional mit Port (Standard: 1883), z. B.
 `192.168.1.20` oder `192.168.1.20:1883`.

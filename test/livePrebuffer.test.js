@@ -79,3 +79,25 @@ test('does not replay bytes from a stopped MPEG-TS connection', () => {
   prebuffer.acquire(liveSink);
   assert.deepEqual(writes, [stale]);
 });
+
+test('disables h264_metadata only for an opted-out RTSP camera', async () => {
+  const log = { info() {}, warn() {}, error() {} };
+  const cases = [
+    { isRtmp: false, rtspH264Metadata: false, expectedFilter: false },
+    { isRtmp: false, rtspH264Metadata: true, expectedFilter: true },
+    { isRtmp: true, rtspH264Metadata: false, expectedFilter: true },
+  ];
+
+  for (const { isRtmp, rtspH264Metadata, expectedFilter } of cases) {
+    const prebuffer = new LivePrebuffer(process.execPath, 'unused-source', isRtmp, log, 'test', false, rtspH264Metadata);
+    prebuffer.spawnProcess();
+    const proc = prebuffer.process;
+    assert.ok(proc);
+    const filterIndex = proc.spawnargs.indexOf('-bsf:v');
+    assert.equal(filterIndex >= 0, expectedFilter);
+    if (expectedFilter) {
+      assert.equal(proc.spawnargs[filterIndex + 1], 'h264_metadata=level=auto,h264_mp4toannexb');
+    }
+    await new Promise((resolve) => proc.once('close', resolve));
+  }
+});

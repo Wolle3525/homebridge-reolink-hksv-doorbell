@@ -208,6 +208,12 @@
               "title": "RTMP (BCS) statt RTSP für Live-Ansicht verwenden",
               "type": "boolean",
               "description": "Standardmäßig deaktiviert (RTSP). Reolinks RTSP-Server basiert auf einer alten, für langsamen Verbindungsaufbau bekannten Bibliothek. RTMP/BCS ist Reolinks eigener, moderner Streaming-Weg (auch von den offiziellen Apps genutzt) und kann zuverlässiger sein, falls die Live-Ansicht dauerhaft lädt."
+            },
+            "rtspH264Metadata": {
+              "title": "RTSP: H.264-Metadaten anpassen",
+              "type": "boolean",
+              "default": true,
+              "description": "Standardmäßig eingeschaltet. Wenn das RTSP-Livebild nicht startet und im Log 'h264_metadata' zusammen mit 'Invalid value at time_scale' erscheint, diesen Schalter ausschalten. Die Einstellung gilt nur für diese Kamera; RTMP bleibt unverändert."
             }
           }
         }
@@ -270,7 +276,8 @@
             "cameras[].prebufferLength",
             "cameras[].fragmentLength",
             "cameras[].standaloneAccessory",
-            "cameras[].liveViewRtmp"
+            "cameras[].liveViewRtmp",
+            "cameras[].rtspH264Metadata"
           ]
         }
       ]

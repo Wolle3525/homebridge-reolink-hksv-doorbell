@@ -244,6 +244,7 @@ export class StreamingDelegate implements CameraStreamingDelegate {
         this.log,
         `${this.cameraConfig.name} live`,
         this.debug,
+        this.cameraConfig.rtspH264Metadata !== false,
       );
     }
 

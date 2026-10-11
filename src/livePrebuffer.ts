@@ -71,6 +71,7 @@ export class LivePrebuffer {
     private readonly log: Logger,
     private readonly label: string,
     private readonly debug: boolean,
+    private readonly rtspH264Metadata = true,
   ) {}
 
   /** Registers a session's ffmpeg stdin as a destination for the prebuffered stream, starting the background connection if it isn't already running. */
@@ -203,23 +204,13 @@ export class LivePrebuffer {
     } else {
       args.push('-rtsp_transport', 'tcp', '-i', this.sourceUrl);
     }
-    // Passthrough copy of both video and audio, regardless of the per-session codec/audio choice:
-    // this stage only exists to keep one warm upstream connection, so sessions read whichever of
-    // video/audio they need from this single relay. Re-encoding here would be redundant CPU work
-    // (a transcoding session still decodes+encodes downstream from this pipe). Convert RTMP's
-    // length-prefixed H.264 to Annex B after rewriting the SPS; the converter inserts SPS/PPS
-    // before IDR frames so a session connecting mid-stream can decode immediately.
-    //
-    // h264_metadata=level=auto rewrites the SPS's declared H.264 level to one that actually
-    // matches the stream's real resolution/framerate/bitrate, in place, without re-encoding. This
-    // camera's sub-stream SPS declares Level 5.0 (decoded from its SDP: sprop-parameter-sets
-    // Z0IAMvQFAeiA -> profile_idc 0x42 Baseline, level_idc 50) for a 640x480 stream that plainly
-    // doesn't need it - HomeKit's protocol only knows about levels 3.1/3.2/4.0, and forwarding a
-    // stream whose own SPS claims a level HomeKit never negotiated is a plausible reason a session
-    // can transport perfectly (every RTP packet muxed and delivered, no transport-level error) and
-    // still never render an image: the decoder-facing metadata itself was invalid for HomeKit
-    // regardless of how correct the transport is under it.
-    args.push('-map', '0', '-codec', 'copy', '-bsf:v', 'h264_metadata=level=auto,h264_mp4toannexb');
+    // Keep the existing SPS level rewrite by default, including for RTMP. Some RTSP cameras send
+    // SPS data that h264_metadata cannot parse; for those cameras, skip the filter so it cannot
+    // discard video packets. The MPEG-TS muxer handles Annex B conversion when needed.
+    args.push('-map', '0', '-codec', 'copy');
+    if (this.isRtmp || this.rtspH264Metadata) {
+      args.push('-bsf:v', 'h264_metadata=level=auto,h264_mp4toannexb');
+    }
     args.push('-f', 'mpegts', 'pipe:1');
 
     // Any previously buffered backlog belongs to the old connection - once it's gone, replaying
